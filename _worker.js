@@ -117,13 +117,14 @@ export default {
                         let loginAuth = await Authenticate(request, env);
                         if (loginAuth) return Response.redirect(`${url.origin}/panel`, 302);
 
-                        let secretKey = await env.bpb.get('secretKey');
+                        let secretKey = await env.bpb.get('sessionSigningKey');
                         const pwd = await env.bpb.get('pwd');
                         if (!pwd) await env.bpb.put('pwd', 'admin');
 
                         if (!secretKey) {
                             secretKey = generateSecretKey();
-                            await env.bpb.put('secretKey', secretKey);
+                            // Never reuse the legacy key, which old tokens exposed.
+                            await env.bpb.put('sessionSigningKey', secretKey);
                         }
 
                         if (request.method === 'POST') {
@@ -131,7 +132,7 @@ export default {
                             const savedPass = await env.bpb.get('pwd');
 
                             if (password === savedPass) {
-                                const jwtToken = generateJWTToken(secretKey, password);
+                                const jwtToken = await generateJWTToken(secretKey);
                                 const cookieHeader = `jwtToken=${jwtToken}; HttpOnly; Secure; Max-Age=${7 * 24 * 60 * 60}; Path=/; SameSite=Strict`;
                                 
                                 return new Response('Success', {
@@ -173,11 +174,19 @@ export default {
 
                     case '/panel/password':
 
+                        if (request.method !== 'POST') {
+                            return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
+                        }
+
                         let passAuth = await Authenticate(request, env);
                         if (!passAuth) return new Response('Unauthorized!', { status: 401 });           
                         const newPwd = await request.text();
+                        if (newPwd.length < 8 || !/[A-Z]/.test(newPwd) || !/[0-9]/.test(newPwd)) {
+                            return new Response('Password must contain at least one capital letter, one number, and be at least 8 characters long.', { status: 400 });
+                        }
                         const oldPwd = await env.bpb.get('pwd');
                         if (newPwd === oldPwd) return new Response('Please enter a new Password!', { status: 400 });
+                        await env.bpb.put('sessionSigningKey', generateSecretKey());
                         await env.bpb.put('pwd', newPwd);
 
                         return new Response('Success', {
@@ -1231,19 +1240,40 @@ const resolveDNS = async (domain) => {
     }
 }
 
-const generateJWTToken = (password, secretKey) => {
+const encodeBase64Url = (bytes) => btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+
+const decodeBase64Url = (value) => {
+    if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('Invalid token encoding');
+    const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = atob(base64 + '='.repeat((4 - base64.length % 4) % 4));
+    return Uint8Array.from(decoded, character => character.charCodeAt(0));
+};
+
+const importSessionKey = (secretKey, usage) => crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secretKey),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    [usage]
+);
+
+const generateJWTToken = async (secretKey) => {
     const header = {
         alg: 'HS256',
         typ: 'JWT'
     };
 
     const payload = {
-        exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60),
-        data: { password }
+        exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60)
     };
-    const encodedHeader = btoa(JSON.stringify(header));
-    const encodedPayload = btoa(JSON.stringify(payload));
-    const signature = btoa(crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${encodedHeader}.${encodedPayload}.${secretKey}`)));
+    const encoder = new TextEncoder();
+    const encodedHeader = encodeBase64Url(encoder.encode(JSON.stringify(header)));
+    const encodedPayload = encodeBase64Url(encoder.encode(JSON.stringify(payload)));
+    const key = await importSessionKey(secretKey, 'sign');
+    const signature = encodeBase64Url(new Uint8Array(await crypto.subtle.sign(
+        'HMAC', key, encoder.encode(`${encodedHeader}.${encodedPayload}`)
+    )));
 
     return `Bearer ${encodedHeader}.${encodedPayload}.${signature}`;
 }
@@ -1257,34 +1287,36 @@ const generateSecretKey = () => {
 const Authenticate = async (request, env) => {
     
     try {
-        const secretKey = await env.bpb.get('secretKey');
+        const secretKey = await env.bpb.get('sessionSigningKey');
+        if (typeof secretKey !== 'string' || !secretKey) return false;
         const cookie = request.headers.get('Cookie');
         const cookieMatch = cookie ? cookie.match(/(^|;\s*)jwtToken=([^;]*)/) : null;
         const token = cookieMatch ? cookieMatch.pop() : null;
 
-        if (!token) {
-            console.log('token');
-            return false;
-        }
+        if (!token) return false;
 
         const tokenWithoutBearer = token.startsWith('Bearer ') ? token.slice(7) : token;
-        const [encodedHeader, encodedPayload, signature] = tokenWithoutBearer.split('.');
-        const payload = JSON.parse(atob(encodedPayload));
+        const parts = tokenWithoutBearer.split('.');
+        if (parts.length !== 3) return false;
+        const [encodedHeader, encodedPayload, signature] = parts;
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        const header = JSON.parse(decoder.decode(decodeBase64Url(encodedHeader)));
+        if (header?.alg !== 'HS256' || header?.typ !== 'JWT') return false;
+        const key = await importSessionKey(secretKey, 'verify');
+        const validSignature = await crypto.subtle.verify(
+            'HMAC', key, decodeBase64Url(signature),
+            new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`)
+        );
+        if (!validSignature) return false;
 
-        const expectedSignature = btoa(crypto.subtle.digest(
-            'SHA-256',
-            new TextEncoder().encode(`${encodedHeader}.${encodedPayload}.${secretKey}`)
-        ));
-
-        if (signature !== expectedSignature) return false;
+        const payload = JSON.parse(decoder.decode(decodeBase64Url(encodedPayload)));
 
         const now = Math.floor(Date.now() / 1000);
-        if (payload.exp < now) return false;
+        if (!Number.isSafeInteger(payload?.exp) || payload.exp <= now) return false;
 
         return true;
     } catch (error) {
-        console.log(error);
-        throw new Error(`An error occurred while authentication - ${error}`);
+        return false;
     }
 }
 
